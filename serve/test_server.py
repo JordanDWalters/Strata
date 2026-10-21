@@ -5131,8 +5131,9 @@ class TelemetryNoDisks(unittest.TestCase):
 
 
 class AmdWindowsTelemetry(unittest.TestCase):
-    """The AMD backend's readings on Windows: ADL's PMLog sensors (first supported id wins) and the GPU memory
-    counter's instance name for an adapter LUID."""
+    """The AMD backend's readings on Windows: ADL's PMLog sensors (first supported id wins), the GPU memory
+    counter's instance name for an adapter LUID, and the choice between the OS PCIe link properties and the
+    PMLog link channels."""
 
     def test_sensor_choice(self):
         from serve.telemetry import ADL_POWER, ADL_TEMP, ADL_UTIL, adl_pick
@@ -5144,6 +5145,51 @@ class AmdWindowsTelemetry(unittest.TestCase):
         self.assertEqual(adl_pick({19: 79, 28: 51, 73: 287}, ADL_POWER), 287)
         self.assertEqual(adl_pick({23: 84, 30: 2, 73: 120}, ADL_POWER), 120)
         self.assertIsNone(adl_pick({}, ADL_UTIL))
+
+    def test_link_choice(self):
+        # the Windows device property leads; PMLog 40/41 fill gaps; the narrower width wins; a current speed
+        # above the card's own capability is clamped to it (#2614's two findings and our RDNA4 PC, from
+        # telemetry._AmdWindows._link)
+        from serve import telemetry
+        g = telemetry._AmdWindows.__new__(telemetry._AmdWindows)
+        cases = [
+            # our R9700s: Windows says Gen5 x16; ADL's PMLog read an old Gen4 x8
+            ({"gen": 5, "width": 16, "speed_max": 5}, {40: 4, 41: 8},
+             {"pcie_gen": 5, "pcie_gen_max": 5, "pcie_width": 8}),
+            # #2614's XTX: PMLog speed stuck at Gen3; its lanes beat a wired-x16 property down to the real x4
+            ({"gen": 4, "width": 16, "speed_max": 4}, {40: 3, 41: 4},
+             {"pcie_gen": 4, "pcie_gen_max": 4, "pcie_width": 4}),
+            # no cfgmgr32 answer at all: the PMLog channels carry the tile, maximum = negotiated as on Linux
+            ({}, {40: 4, 41: 16}, {"pcie_gen": 4, "pcie_gen_max": 4, "pcie_width": 16}),
+            # a current speed above its own maximum is a stale reading: clamp
+            ({"gen": 5, "width": 16, "speed_max": 4}, {}, {"pcie_gen": 4, "pcie_gen_max": 4, "pcie_width": 16}),
+            # out-of-range values from either side are dropped, not shown
+            ({"gen": 0, "width": 0, "speed_max": 7}, {40: 9, 41: 0},
+             {"pcie_gen": None, "pcie_gen_max": None, "pcie_width": None}),
+            # nothing anywhere: unavailable, never 0
+            ({}, {}, {"pcie_gen": None, "pcie_gen_max": None, "pcie_width": None}),
+        ]
+        for props, sensors, want in cases:
+            with mock.patch.object(g, "_pci_props", return_value=props):
+                self.assertEqual(g._link(sensors), want)
+
+    def test_read_carries_the_link(self):
+        # PMLog sensors plus the OS link values leave read() as the tile's gpu_pcie_* keys
+        from serve import telemetry
+        g = telemetry._AmdWindows.__new__(telemetry._AmdWindows)
+
+        class Adl:
+            def ADL2_New_QueryPMLogData_Get(self, ctx, adapter, buf):
+                for sid, value in ((19, 57), (28, 63), (73, 44), (40, 4), (41, 8)):
+                    buf[1 + 2 * sid], buf[2 + 2 * sid] = 1, value
+                return 0
+
+        g.adl, g.ctx, g.adapter, g.pdh, g.counter, g.total = Adl(), None, 0, None, None, None
+        with mock.patch.object(g, "_pci_props", return_value={"gen": 5, "width": 16, "speed_max": 5}):
+            got = g.read()
+        self.assertEqual((got["util"], got["temp"], got["power"]), (57, 63.0, 44.0))
+        self.assertEqual((got["pcie_gen"], got["pcie_gen_max"], got["pcie_width"]), (5, 5, 8))
+        self.assertIsNone(got["mem_used"])
 
     def test_close_gives_the_handles_back_once(self):
         from serve import telemetry

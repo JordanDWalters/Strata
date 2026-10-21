@@ -4,7 +4,9 @@ A background thread samples once a second and keeps the last 60 readings of each
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
   pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
   amdgpu driver's Linux sysfs files - load, VRAM, temperature and power; on Windows the AMD driver's ADL library
-  (atiadlxx.dll, installed with Adrenalin) and the OS's GPU memory counter - the same four.  On macOS (Metal backend):
+  (atiadlxx.dll, installed with Adrenalin) gives load, temperature and power, the OS's GPU memory counter the VRAM
+  in use, and the OS's own device properties the PCIe link (ADL's PMLog link channels fill in where those are
+  missing).  On macOS (Metal backend):
   IOKit's IOAccelerator registry - load and VRAM; the temperature and power sensors need root (`powermetrics`), and an
   Apple Silicon GPU sits on the die, so there is no PCIe link.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
@@ -357,6 +359,25 @@ WINDOWS = os.name == "nt"
 ADL_UTIL = (19,)                    # PMLOG_INFO_ACTIVITY_GFX
 ADL_TEMP = (28, 8, 27, 29)          # PMLOG_TEMPERATURE_GFX, _EDGE, _HOTSPOT, _SOC
 ADL_POWER = (73, 23, 30)            # PMLOG_BOARD_POWER, PMLOG_ASIC_POWER, PMLOG_GFX_POWER
+ADL_BUS_SPEED, ADL_BUS_LANES = 40, 41       # PMLOG_BUS_SPEED / PMLOG_BUS_LANES
+
+# Windows' own PCIe link values for a started PCI device: the DEVPKEY_PciDevice_* property set
+# {3AB22E31-8264-4B4E-9AF5-A8D2D8E33E62}, pids current speed 9, current width 10, maximum speed 11 (verified on
+# an R9700 against Get-PnpDeviceProperty).  #2614 (RX 7900 XTX) and our RDNA4 test PC have both seen ADL's PMLog
+# BUS_SPEED sit a generation under the link Windows reports, so the OS values come first and the PMLog channels
+# only back them up.
+PCI_SET = (0x3AB22E31, 0x8264, 0x4B4E, (0x9A, 0xF5, 0xA8, 0xD2, 0xD8, 0xE3, 0x3E, 0x62))
+PCI_SPEED, PCI_WIDTH, PCI_SPEED_MAX = 9, 10, 11
+
+
+def _valid_gen(value):
+    """A PCIe generation (1..6), or None for anything else."""
+    return value if isinstance(value, int) and 1 <= value <= 6 else None
+
+
+def _valid_lanes(value):
+    """A PCIe link width (1..256 lanes), or None for anything else."""
+    return value if isinstance(value, int) and 1 <= value <= 256 else None
 
 
 def adl_pick(sensors: dict, ids):
@@ -371,10 +392,11 @@ def luid_instance(high: int, low: int) -> str:
 
 class _AmdWindows:
     """An AMD card's readings on Windows, with _Nvml's interface: load, temperature and power from the PMLog sensors
-    of the driver's ADL library (atiadlxx.dll, part of every Adrenalin install), the memory size from ADL, and the
-    memory in use from the OS counter "\\GPU Adapter Memory(<luid>)\\Dedicated Usage" (pdh.dll), its adapter found
-    by PCI bus through D3DKMT.  (ADL's own VRAM-usage call reads nonsense on a Strix Halo.)  `index`: the AMD cards
-    in PCI bus order, as HIP numbers them."""
+    of the driver's ADL library (atiadlxx.dll, part of every Adrenalin install), the memory size from ADL, the
+    memory in use from the OS counter "\\GPU Adapter Memory(<luid>)\\Dedicated Usage" (pdh.dll) - its adapter found
+    by PCI bus through D3DKMT - and the PCIe link from the card's own device properties (cfgmgr32), with ADL's PMLog
+    link channels as the fallback.  (ADL's own VRAM-usage call reads nonsense on a Strix Halo.)  `index`: the AMD
+    cards in PCI bus order, as HIP numbers them."""
 
     class _AdapterInfo(ctypes.Structure):
         _fields_ = [("iSize", ctypes.c_int), ("iAdapterIndex", ctypes.c_int), ("strUDID", ctypes.c_char * 256),
@@ -392,12 +414,19 @@ class _AmdWindows:
     class _PdhValue(ctypes.Structure):
         _fields_ = [("CStatus", ctypes.c_ulong), ("largeValue", ctypes.c_longlong)]
 
+    class _Key(ctypes.Structure):
+        """DEVPROPKEY as cfgmgr32 takes it: the property-set GUID and the property id in one struct."""
+        class _Guid(ctypes.Structure):
+            _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort), ("d3", ctypes.c_ushort),
+                        ("d4", ctypes.c_ubyte * 8)]
+        _fields_ = [("fmtid", _Guid), ("pid", ctypes.c_ulong)]
+
     _MALLOC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
     _malloc = None                  # ADL allocates through this; kept alive with the class
 
     def __init__(self, index=0):
         self.adl = self.ctx = self.adapter = self._lib = None
-        self.bus = self.label = self.total = None
+        self.bus = self.label = self.total = self.pnp = None
         self.pdh = self.query = self.counter = None
         try:
             self._open_adl(index)
@@ -464,6 +493,7 @@ class _AmdWindows:
         a = ordered[index]
         self.adapter, self.bus = a.iAdapterIndex, a.iBusNumber
         self.label = a.strAdapterName.decode(errors="replace").strip() or "AMD Radeon"
+        self.pnp = a.strPNPString.decode(errors="replace").strip() or None
         m = self._MemInfo2()
         if self.adl.ADL2_Adapter_MemoryInfo2_Get(self.ctx, self.adapter, ctypes.byref(m)) == 0 and m.iMemorySize > 0:
             self.total = m.iMemorySize
@@ -537,18 +567,71 @@ class _AmdWindows:
             return None
         return v.largeValue if v.CStatus in (0, 1) else None   # PDH_CSTATUS_VALID_DATA / _NEW_DATA
 
+    def _pci_props(self) -> dict:
+        """What Windows itself says about this card's PCIe link: the current speed and width and the maximum
+        speed, from the device properties (cfgmgr32 CM_Get_DevNode_PropertyW, DEVPKEY_PciDevice_*).  The device
+        is the one ADL names by its PnP instance string, so a disconnected phantom instance of the same card
+        model cannot be picked (#2614 saw one carry an old link value).  {} off Windows or when nothing reads."""
+        if not self.pnp:
+            return {}
+        try:
+            cm = ctypes.WinDLL("cfgmgr32")
+        except (AttributeError, OSError):
+            return {}
+
+        def prop(pid):
+            key = self._Key()
+            key.fmtid.d1, key.fmtid.d2, key.fmtid.d3 = PCI_SET[0], PCI_SET[1], PCI_SET[2]
+            key.fmtid.d4 = PCI_SET[3]
+            key.pid = pid
+            kind, value = ctypes.c_ulong(), ctypes.c_uint()
+            size = ctypes.c_ulong(ctypes.sizeof(value))
+            if cm.CM_Get_DevNode_PropertyW(dev, ctypes.byref(key), ctypes.byref(kind),
+                                           ctypes.cast(ctypes.byref(value), ctypes.c_void_p),
+                                           ctypes.byref(size), ctypes.c_uint(0)) != 0 or size.value != 4:
+                return None
+            return value.value
+
+        dev = ctypes.c_uint()
+        if cm.CM_Locate_DevNodeW(ctypes.byref(dev), ctypes.c_wchar_p(self.pnp), ctypes.c_uint(0)) != 0:
+            return {}
+        return {"gen": prop(PCI_SPEED), "width": prop(PCI_WIDTH), "speed_max": prop(PCI_SPEED_MAX)}
+
+    def _link(self, sensors: dict) -> dict:
+        """The PCIe tile's readings, following the same conservative rule as the Linux reader (#1733): never
+        claim a wider or faster link than is known.  The OS values come first, because #2614's RX 7900 XTX and
+        our RDNA4 PC have both seen ADL's PMLog BUS_SPEED (40) sit generations under the link Windows reports;
+        a current speed above its own capability is clamped to it, and PMLog's 40/41 fill in only where a
+        property is missing.  For the width the **smaller** of the OS value and PMLog's lanes wins: #2614 saw a
+        device property report the card's wiring (x16) over a narrower negotiated link (x4 in a slot), while
+        PMLog's lane count agreed with the slot."""
+        os_link = self._pci_props()
+        gen = _valid_gen(os_link.get("gen"))
+        gen_max = _valid_gen(os_link.get("speed_max"))
+        width = _valid_lanes(os_link.get("width"))
+        if gen is not None and gen_max is not None and gen > gen_max:
+            gen = gen_max
+        pm_gen, pm_lanes = _valid_gen(sensors.get(ADL_BUS_SPEED)), _valid_lanes(sensors.get(ADL_BUS_LANES))
+        if gen is None and pm_gen is not None and (gen_max is None or pm_gen <= gen_max):
+            gen = pm_gen
+        if gen_max is None:
+            gen_max = gen                        # as on Linux: only the negotiated link is known
+        lanes = [w for w in (width, pm_lanes) if w is not None]
+        return {"pcie_gen": gen, "pcie_gen_max": gen_max, "pcie_width": min(lanes) if lanes else None}
+
     def read(self):
         if not self.ok():
             return {}
         try:
             s = self._sensors()
             used = self._mem_used()
-        except OSError:
+            link = self._link(s)
+        except (AttributeError, OSError):
             return {}
         util, temp, power = adl_pick(s, ADL_UTIL), adl_pick(s, ADL_TEMP), adl_pick(s, ADL_POWER)
         return {"util": util, "mem_used": used, "mem_total": self.total if used is not None else None,
                 "temp": float(temp) if temp is not None else None,
-                "power": float(power) if power is not None else None, "power_limit": None}
+                "power": float(power) if power is not None else None, "power_limit": None, **link}
 
 
 def gpu_reader(index=0, amd=False):
